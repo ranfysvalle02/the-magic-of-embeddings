@@ -267,6 +267,67 @@ And this is why the output weights stay coherent: they *never* learn to read raw
 
 ---
 
+## What Moves the Knobs: Frequency, Loss, and Human Feedback
+
+The previous section said the backward pass nudges every knob "in the direction that reduced the error." That's the one piece we've taken on faith. Here's what that nudge actually is — and why it produces a model that knows ratios, not rules.
+
+### 1. The objective: learn a distribution, not a verdict
+
+The base training task is almost insultingly simple: **read some text, predict the next token.** Crucially, the model does not learn a rule like *"X is the correct database."* It learns a *probability distribution* over what could come next.
+
+If the training text contains `the best database is ___` followed by `X` 100 times, `Y` 20 times, and `Z` 5 times, a well-trained model lands near:
+
+```
+X -> 0.80
+Y -> 0.16
+Z -> 0.04
+```
+
+But — and this is the part the "it just counts" intuition gets wrong — **the model never tallies anything.** It has no table of counts. It starts with random weights and is pushed, one sentence at a time, toward outputs that minimize a penalty. The mathematical minimizer of that penalty *is* the true conditional frequency of the data. The distribution above is an emergent property of optimization, not bookkeeping.
+
+### 2. The penalty is Loss — and it's graded, not pass/fail
+
+The penalty has a name: **cross-entropy loss**. For a single prediction it is just:
+
+```
+loss = -log( probability the model assigned to the ACTUAL next token )
+```
+
+Read what that formula does:
+
+- The model reads `...the best database is` and (from raw frequency) leans `X`. The actual next token in *this* article is `Y`.
+- Because the model assigned `Y` only ~0.16, it takes a penalty of `-log(0.16) ≈ 1.83`.
+- Had it been *confidently* wrong — assigning `Y` just 0.02 — the penalty would be `-log(0.02) ≈ 3.91`. Much larger.
+
+This is the correction to the "rigid grade" intuition: **loss is fluid.** `X` is never declared "wrong." A hesitant miss is cheap; a confident miss is expensive. The model is being pulled, not judged — and `X` stays a perfectly good guess for the *next* sentence.
+
+### 3. Backpropagation sculpts everything at once
+
+One penalty produces one error signal, and **backpropagation sends it backward through the entire stack** — the output weights, every attention projection (`W_Q/W_K/W_V`), *and* the embedding table — in a single pass. There is no separate "train the embeddings" step.
+
+It's tempting to split the labor cleanly — *embeddings memorize the context-free baseline, attention learns the situational routing* — and as a rough description of what each tends to carry, that's fair. But they are not trained independently. The same penalty adjusts both simultaneously:
+
+- it tugs the embedding for `database` slightly toward whatever followed it, and
+- it tugs the attention matrices so that next time the word `bank` (or `startup`) is nearby, the relevant sense gets pulled in.
+
+Run this over a whole dataset and the knobs settle into an **equilibrium**: a single set of weights whose forward pass reproduces the data's statistics *conditioned on context*. That conditioning is why the model isn't stupid — it doesn't just spam the most frequent word; attention lets `startup` steer the answer one way and `bank` steer it another, from the same baseline.
+
+### 4. Phase 2: human feedback can overrule raw frequency (RLHF)
+
+Frequency has an obvious failure mode. If a spammy phrase like `the best database is X` floods the internet 10,000 times, Phase 1 will dutifully learn that `X` is the likely answer — even if `X` is terrible. Raw frequency has no notion of *good*.
+
+Phase 2 changes the teacher. This is **RLHF (Reinforcement Learning from Human Feedback)**, and it does *not* simply backpropagate a human's 0–10 score on one answer. The actual loop:
+
+1. The model produces several candidate answers; humans mark **which they prefer** (pairwise comparisons).
+2. Those preferences train a separate **reward model** that learns to predict what humans like.
+3. The LLM is then optimized to **maximize that reward**, with a KL penalty acting as a leash so it stays close to the Phase-1 model and doesn't forget how to speak.
+
+The effect is exactly the override you'd want: the weights that made `X` dominant get pushed down, and genuinely helpful answers get pushed up — **even though `X` was more frequent in the raw text.** Human preference, distilled into the reward model, beats internet frequency.
+
+> Phase 1 teaches the CEO and the Assistant to mirror everything the world *says*. Phase 2 brings in expert graders who teach them what the world *should have said* — and the same backpropagation that absorbed the internet now reshapes those instincts toward being correct and helpful.
+
+---
+
 ## The Complete Picture in Five Sentences
 
 1. Embeddings give each token a fixed, context-free location in meaning-space (just a lookup table — Box A).
@@ -301,3 +362,53 @@ python demo.py
 The script walks the pipeline end-to-end: it prints the static embeddings (Box A), the full attention matrix per sentence, the context vector for `bark` under each scenario, and the output head's verdict. It then re-runs the dog sentence with the lock-and-key projections so you can watch `loud`'s attention shift from itself to `dog` in real time.
 
 If a paragraph in this post stopped making sense, find the matching section in [`demo.py`](demo.py), change a number, and run it again. The numbers don't lie — and once you've watched the same `bark` vector come out two different ways, the magic stops feeling like magic.
+
+-----
+
+# Appendix: The Gap to Commercial LLMs
+
+The `demo.py` script and the conceptual model above map perfectly to the *logic* of a modern Transformer. But bridging the gap from a toy model to commercial juggernauts like GPT-4, Llama 3, or Gemini 1.5 Pro requires scaling that logic up by several orders of magnitude and solving the engineering bottlenecks that emerge.
+
+Here is what the gap actually looks like in practice.
+
+### 1. The Vocabulary: Sub-word Tokenization
+
+In our toy model, the embedding lookup table (`Box A`) maps raw, whole words (like "bark") to vectors. Commercial LLMs do not use whole words; they use **sub-word tokenization** (typically via Byte-Pair Encoding).
+
+* **The Problem:** English alone has over a million words. Accounting for misspellings, code snippets, URLs, and multiple languages would make the lookup table impossibly large and sparse.
+* **The Solution:** The model learns a fixed vocabulary of sub-word chunks based on statistical frequency. "Bark" might be one token, but "Unbelievable" might be split into the tokens `Un`, `believ`, and `able`.
+* **The Scale:** While our demo had 8 words, modern models generally operate with a vocabulary size of over 128,000 unique tokens.
+
+### 2. The Width: Embedding Dimensions
+
+In our demo, the "meaning space" has exactly 4 dimensions (`nature`, `canine`, `sound`, `texture`).
+
+* **The Reality:** Human language requires vastly more nuance to capture syntax, tone, logical relationships, and microscopic semantic distinctions.
+* **The Scale:** Commercial models use embeddings with thousands of dimensions. A model like GPT-3 uses 12,288 dimensions. Every word is represented by a coordinate in a 12,288-dimensional space, meaning the projections for Query, Key, and Value scale quadratically to match.
+
+### 3. The Depth: Layers and Multi-Head Attention
+
+Our analogy featured a single CEO and a single Expert Research Assistant. In reality, Transformers stack these components both horizontally and vertically.
+
+* **Multi-Head Attention (Horizontal):** Instead of one Assistant, picture 96 specialized Assistants reading the exact same files simultaneously. One Assistant might look exclusively for grammatical structure, another for chronological order, and another for emotional tone. They each produce a memo, which are then concatenated.
+* **Deep Layers (Vertical):** The context vector produced by the first Attention layer doesn't go straight to the output weights. It gets passed up to a *second* Attention layer, which treats that first memo as its new raw material.
+* **The Scale:** A modern LLM might feature 96 to 128 Attention heads per layer, and stack 80 to 120 layers deep before the final output weights make a decision.
+
+### 4. The Context Window and Positional Memory
+
+Because Attention evaluates every token against every other token simultaneously, it is fundamentally a set operation with no inherent concept of sequence. "The dog bit the man" and "The man bit the dog" look mathematically identical to raw Attention.
+
+* **Positional Encodings:** To solve this, the model mathematically injects "seat numbers" into the initial embeddings so the Attention layer knows where each token sits in the sequence. Modern models use techniques like RoPE (Rotary Position Embedding) to handle relative distances gracefully.
+* **The Memory Bottleneck:** Because Attention requires every token to compare itself to every other token, the compute and memory requirements scale quadratically. Processing 100,000 tokens requires 10 billion comparisons per head, per layer.
+* **The Scale:** Context windows have expanded dramatically. While early models launched with a 4,096-token window, models today routinely handle millions of tokens. This is only possible due to heavy hardware optimization (like FlashAttention) and memory caching tricks (KV Caching) to prevent the math from crashing the GPUs.
+
+### 5. Mixture of Experts (MoE)
+
+As models grew larger to absorb more knowledge, passing every single token through every single parameter became too slow and expensive.
+
+* **The Routing Mechanism:** State-of-the-art architectures rely on MoE. Instead of one massive feed-forward network in each layer, they house several smaller, specialized "Expert" networks. A router evaluates each token on the fly and sends it only to the top 1 or 2 experts best suited to handle it.
+* **The Impact:** This decouples the model's *knowledge capacity* from its *computational cost*. A model might have 1.5 trillion parameters in total, but only "activate" 100 billion of them during any single forward pass.
+
+---
+
+The real magic is that despite these massive engineering feats—the 100+ layers, the 12,000-dimensional geometry, the complex MoE routing, and the million-token context windows—the core engine driving the situational awareness remains exactly the same as the math in the demo. It is still just a matrix of embeddings being rewritten by the neighbors that showed up.
