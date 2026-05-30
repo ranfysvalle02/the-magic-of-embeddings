@@ -20,6 +20,8 @@ Even with that picture in hand, most people run into the same wall — a nagging
 
 This post exists to dissolve that confusion completely. By the end, you'll have one clean mental model where embeddings, attention, training, and inference each have exactly one job and one place to stand.
 
+And because hand-waving is the enemy of understanding, every claim that follows is backed by [`demo.py`](demo.py) — a tiny, dependency-free Python script that prints the numbers as they pop out of each stage. Run it with `python demo.py` while you read; every block of output you see in this post comes from there.
+
 ---
 
 ## The One-Sentence Role of Attention
@@ -64,6 +66,25 @@ Map this onto our corporate analogy:
 
 The thing to internalize: **attention is a *transformation between two representations*, not a module bolted onto the side.** It takes embeddings in and hands context vectors out. That's its whole life.
 
+To make that absolutely concrete: in [`demo.py`](demo.py) the bottom of the stack is literally a Python dict. Four hand-picked dimensions — `nature`, `canine`, `sound`, `texture` — and a row per word.
+
+```72:83:demo.py
+DIMS = ["nature", "canine", "sound", "texture"]
+
+EMBEDDING_TABLE: Dict[str, Vector] = {
+    "the":  [0.10, 0.10, 0.10, 0.10],
+    "of":   [0.10, 0.10, 0.10, 0.10],
+    "a":    [0.10, 0.10, 0.10, 0.10],
+    "made": [0.10, 0.20, 0.40, 0.10],
+    "bark": [0.70, 0.70, 0.40, 0.40],  # ambiguous on purpose
+    "tree": [1.00, 0.00, 0.10, 0.80],
+    "dog":  [0.10, 1.00, 0.60, 0.20],
+    "loud": [0.00, 0.20, 1.00, 0.00],
+}
+```
+
+That dict is Box A. `embed(tokens)` is just `[EMBEDDING_TABLE[t] for t in tokens]`. Notice `bark` has both nature-ish *and* canine-ish properties baked in — it sits on the bridge between two neighbourhoods, exactly as advertised. The whole rest of the post is about what attention does with that ambiguous row once it's looked up.
+
 ---
 
 ## Attention's Relationship to Embeddings
@@ -92,6 +113,58 @@ The clean summary:
 
 > **Embedding = the address. Attention = the routing logic that reads addresses and rewrites them based on the neighborhood that actually turned up.**
 
+And to prove the address-rewriting isn't a metaphor, here's what falls out of [`demo.py`](demo.py) when you run the two sentences. The static row for `bark` is identical in both. The context vector that comes out of attention is not.
+
+```
+static  bark        -> [nature=+0.70, canine=+0.70, sound=+0.40, texture=+0.40]
+context bark (tree) -> [nature=+0.57, canine=+0.29, sound=+0.21, texture=+0.40]
+context bark (dog)  -> [nature=+0.26, canine=+0.52, sound=+0.47, texture=+0.20]
+```
+
+Same word, two situational meanings. Canine collapses in the tree sentence; nature collapses in the dog sentence. The output head — a tiny matrix scoring `tree_meaning` vs `dog_meaning` from the context vector alone — reads `tree_meaning` at 0.68 for the first and `dog_meaning` at 0.63 for the second, never seeing the raw word at all.
+
+---
+
+## Lock and Key: Why Q and K Aren't the Same Vector
+
+The cleanest version of the demo cheats slightly. It uses `W_Q = W_K = W_V = I`, which collapses queries, keys, and values back into the original embedding. That makes the dot products easy to read but hides the whole reason Q and K exist as separate matrices in the first place.
+
+So in [`demo.py`](demo.py) there's a second pair of projections, hand-authored to make the asymmetry visible:
+
+```140:152:demo.py
+W_Q_LOCKKEY: Matrix = [
+    [0.0, 0.0, 1.0, 0.0],   # ask channel 0: my sound -> seeks canine
+    [1.0, 0.0, 0.0, 0.0],   # ask channel 1: my nature -> seeks nature
+    [0.0, 0.0, 0.0, 1.0],   # ask channel 2: my texture -> seeks texture
+    [0.0, 0.0, 0.0, 0.0],
+]
+
+W_K_LOCKKEY: Matrix = [
+    [0.0, 1.0, 0.0, 0.0],   # advertise channel 0: I am canine
+    [1.0, 0.0, 0.0, 0.0],   # advertise channel 1: I am nature
+    [0.0, 0.0, 0.0, 1.0],   # advertise channel 2: I am texture
+    [0.0, 0.0, 0.0, 0.0],
+]
+```
+
+Read channel 0 of each. The query side pulls from a token's *sound* dimension. The key side pulls from a token's *canine* dimension. They meet on the same axis. The geometric consequence: a high-sound query collides with a high-canine key — across tokens, on a dimension the two words don't even share inside the embedding.
+
+Re-running `the dog made a loud bark` with these projections and comparing `loud`'s row of the attention matrix gives:
+
+```
+                 the     dog    made       a    loud    bark
+    identity    0.11    0.21    0.15    0.11    0.27    0.16
+    lock&key    0.12    0.29    0.13    0.12    0.13    0.21
+
+loud -> dog jumped from 0.21 to 0.29  (delta = +0.08)
+```
+
+Under identity, `loud`'s strongest attention is on itself. Under lock-and-key, it's on `dog` — and nothing about the embedding for `loud` has changed. We only rewired which property of `loud` becomes a search request and which property of `dog` becomes an advertised label. That, finally, is the concrete payoff for the earlier claim that:
+
+> The learned projections (`W_Q`, `W_K`) decide which of those properties become a *search request* versus an *advertised label*.
+
+A query and a key can disagree about which dimension matters because they're different functions of the same row. That single fact is half of what makes attention more than a similarity search.
+
 ---
 
 ## The Confusing Part: "Don't You Need an Embedding Model?"
@@ -110,7 +183,14 @@ This is the kind of embedding we've been talking about so far — the static coo
 "bark"  ──(token id = 8423)──>  row 8423 of the matrix  ──>  [0.7 nature, 0.7 canine, ...]
 ```
 
-That's the entire operation: an integer index into a table. No attention, no QKV, no layers. It is the *bottom rung* of the stack — it sits **below** attention and **feeds** it.
+That's the entire operation: an integer index into a table. No attention, no QKV, no layers. It is the *bottom rung* of the stack — it sits **below** attention and **feeds** it. In [`demo.py`](demo.py) this is laid bare: `EMBEDDING_TABLE` is a Python dict, and `embed()` is one line:
+
+```86:87:demo.py
+def embed(tokens: List[str]) -> List[Vector]:
+    return [EMBEDDING_TABLE[t] for t in tokens]
+```
+
+There is no model under there. You hit the floor.
 
 **Where do the table's numbers come from?** They're just weights. They start random and get sculpted by gradient descent during training, *jointly* with `W_Q/W_K/W_V` and the output weights — all in the same backward pass. No separate model produces them. The table *is* part of the transformer.
 
@@ -181,6 +261,8 @@ This is the correction that keeps the whole architectural picture from collapsin
 
 And this is why the output weights stay coherent: they *never* learn to read raw words. In **both** phases, they only ever see attention's output. The model learns to interpret exactly the kind of thing it will be handed at runtime. Training and inference share the same intermediate language — the context vector — which is the reason the model trained yesterday still makes sense of your prompt today.
 
+[`demo.py`](demo.py) makes the "frozen" half of this picture very literal — `EMBEDDING_TABLE`, `W_Q`, `W_K`, `W_V`, `OUTPUT_WEIGHTS`, and `W_Q_LOCKKEY` / `W_K_LOCKKEY` are all module-level constants. The script only ever runs the forward pass. The "training" half of the table would simply replace each of those constants with a tensor that has a gradient — same code path, same dot products, same softmax — just with the additional rule that after every forward pass, every constant gets a small nudge in the direction that reduced the error. Nothing else changes.
+
 > When the CEO went to business school, the Assistant sat right next to them the entire time. The CEO never learned to read raw files — they learned to read the Assistant's memos. So when a real memo lands on the desk at inference time, it's written in precisely the language the CEO spent years learning to interpret.
 
 ---
@@ -205,3 +287,17 @@ Not in a ghost in the machine, and not in any single one of these parts. It live
 - A training process that sculpts all three at once, then freezes them.
 
 Attention is the piece in the middle that makes the other three worth having. Embeddings would be inert without it; the output weights would be reading noise without it. It is the layer where context becomes geometry — and that, far more than any single learned fact, is the real magic of attention.
+
+---
+
+## Run it Yourself
+
+Everything in this post is reproducible in under a second on any Python 3 install. No dependencies, no GPUs, no model downloads.
+
+```
+python demo.py
+```
+
+The script walks the pipeline end-to-end: it prints the static embeddings (Box A), the full attention matrix per sentence, the context vector for `bark` under each scenario, and the output head's verdict. It then re-runs the dog sentence with the lock-and-key projections so you can watch `loud`'s attention shift from itself to `dog` in real time.
+
+If a paragraph in this post stopped making sense, find the matching section in [`demo.py`](demo.py), change a number, and run it again. The numbers don't lie — and once you've watched the same `bark` vector come out two different ways, the magic stops feeling like magic.
